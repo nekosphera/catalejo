@@ -249,9 +249,16 @@ $(render_triple <"${to_insert}")
   # Which ones, by subject and predicate. A run that keeps reporting the same
   # difference is not converging, and a count alone cannot say why. Objects are
   # left out: the catalog is public but the log does not need to carry it.
+  #
+  # head reads the file and jq consumes what head gives it, rather than jq
+  # writing into a head that stops listening. With pipefail the second shape
+  # kills the run with SIGPIPE as soon as the difference is longer than the
+  # pipe buffer - after the update has already been written, so the catalogue
+  # is correct and the run reports failure. It survived until now because a
+  # small difference fits in the buffer before head exits.
   if [[ "${FEDERATION_LOG_CHANGES:-true}" == true ]]; then
-    jq -r '"  + \(.s) \(.p)"' <"${to_insert}" | head -20
-    jq -r '"  - \(.s) \(.p)"' <"${to_delete}" | head -20
+    head -20 "${to_insert}" | jq -r '"  + \(.s) \(.p)"'
+    head -20 "${to_delete}" | jq -r '"  - \(.s) \(.p)"'
   fi
   rm -f "${current_file}" "${current_file}.sorted" "${DESIRED_FILE}.sorted" \
     "${to_insert}" "${to_delete}"
@@ -634,7 +641,12 @@ ingest_connector() {
     [[ -z "${contract_id}" ]] && continue
     access_policy_id=$(echo "${row}" | jq -r '.accessPolicyId // empty')
     contract_policy_id=$(echo "${row}" | jq -r '.contractPolicyId // empty')
-    selected_asset_id=$(echo "${row}" | jq -r '.assetsSelector[]? | select((.leftOperand=="id") or (.operandLeft=="https://w3id.org/edc/v0.0.1/ns/id")) | (.rightOperand // .operandRight // empty)' | head -n1)
+    # first() inside jq rather than head outside it. A contract definition
+    # with two selectors on id would make jq write a second line into a head
+    # that had already gone, and the SIGPIPE would abort the run through the
+    # command substitution. first() stops on its own and emits nothing when
+    # there is no match, which is the case the empty check below handles.
+    selected_asset_id=$(echo "${row}" | jq -r 'first(.assetsSelector[]? | select((.leftOperand=="id") or (.operandLeft=="https://w3id.org/edc/v0.0.1/ns/id")) | (.rightOperand // .operandRight // empty)) // empty')
 
     local contract_uri access_policy_uri contract_policy_uri selected_asset_uri
     contract_uri="urn:dataspace:${connector_name}:contract:${contract_id}"
