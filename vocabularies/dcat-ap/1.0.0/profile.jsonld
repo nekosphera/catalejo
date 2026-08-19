@@ -6,7 +6,7 @@
     "odrl": "http://www.w3.org/ns/odrl/2/",
     "prov": "http://www.w3.org/ns/prov#"
   },
-  "@id": "https://www.mydataspace.es/vocabularies/dcat-ap-mydataspace/1.0.0",
+  "@id": "https://www.mydataspace.es/vocabularies/dcat-ap-mydataspace/1.0.0/profile.jsonld",
   "@type": "dct:Standard",
   "dct:title": "MyDataSpace DCAT-AP profile",
   "dct:hasVersion": "1.0.0",
