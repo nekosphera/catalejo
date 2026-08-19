@@ -12,17 +12,19 @@
       "@container": "@language"
     }
   },
-  "@id": "https://www.mydataspace.es/ns",
-  "@type": "owl:Ontology",
-  "dct:title": "MyDataSpace terms",
-  "dct:description": "The terms MyDataSpace adds to DCAT, DCAT-AP and ODRL, and nothing more. Where a term extends a standard vocabulary the standard one is used instead; these exist because no standard term carried the meaning. The normative documents are the profiles that use them: the DCAT-AP profile and its SHACL shapes, and the ODRL policy profile. This document is the index of the namespace, so that a reader who meets one of these IRIs in a catalogue can find out what it means.",
-  "dct:hasVersion": "1.0.0",
-  "rdfs:seeAlso": [
-    "https://www.mydataspace.es/vocabularies/dcat-ap-mydataspace/1.0.0/profile.jsonld",
-    "https://www.mydataspace.es/vocabularies/dcat-ap-mydataspace/1.0.0/index.html",
-    "https://www.mydataspace.es/vocabularies/policies/1.0.0/odrl-profile"
-  ],
   "@graph": [
+    {
+      "@id": "https://www.mydataspace.es/ns",
+      "@type": "owl:Ontology",
+      "dct:title": "MyDataSpace terms",
+      "dct:description": "The terms MyDataSpace adds to DCAT, DCAT-AP and ODRL, and nothing more. Where a term extends a standard vocabulary the standard one is used instead; these exist because no standard term carried the meaning. The normative documents are the profiles that use them: the DCAT-AP profile and its SHACL shapes, and the ODRL policy profile. This document is the index of the namespace, so that a reader who meets one of these IRIs in a catalogue can find out what it means.",
+      "dct:hasVersion": "1.0.0",
+      "rdfs:seeAlso": [
+        "https://www.mydataspace.es/vocabularies/dcat-ap-mydataspace/1.0.0/profile.jsonld",
+        "https://www.mydataspace.es/vocabularies/dcat-ap-mydataspace/1.0.0/index.html",
+        "https://www.mydataspace.es/vocabularies/policies/1.0.0/odrl-profile"
+      ]
+    },
     {
       "@id": "myds:DatasetShape",
       "@type": "sh:NodeShape",
