@@ -104,7 +104,22 @@ anybody's management API: the requests are recorded where they already pass.
   ships here is the smoke test, which is the one that proves the bundle rather
   than its parts.
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you write a patch. This tree is
+generated from a private repository where the catalogue runs in production, so
+a pull request merged here would be erased by the next export. They are not
+merged here; they are ported upstream and published back, with the authorship
+and the sign-off intact. Open them anyway - this is where the discussion
+happens - and expect to be told which published commit carries your change.
+
+Issues and discussions behave normally.
+
 ## Licence
 
-Apache License 2.0. Third-party components keep their own licences; see
-`THIRD_PARTY_NOTICES.md`.
+Code is under the Apache License 2.0 (`LICENSE`). Documentation is under
+CC BY 4.0 (`DOCUMENTATION-LICENSE.md`). Names and logos are licensed by
+neither: see `TRADEMARKS.md`. Third-party components keep their own licences;
+see `THIRD_PARTY_NOTICES.md`.
+
+Vulnerabilities go to `SECURITY.md`, not to a public issue.
