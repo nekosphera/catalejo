@@ -54,8 +54,14 @@ CONNECTOR1_URL="${CONNECTOR1_URL:-http://localhost:8080}"
 CONNECTOR1_CLIENT_ID="${CONNECTOR1_CLIENT_ID:-edc-connector}"
 CONNECTOR1_CLIENT_SECRET="${CONNECTOR1_CLIENT_SECRET:-}"
 
+# No URL default, the same shape as the third connector below: a deployment
+# that declares one connector has one connector. Inventing a second one at
+# localhost:8081 made every run of a single-connector deployment warn about a
+# missing secret for a connector nobody had configured - which is the first
+# thing anyone following the published quickstart sees. Where a second
+# connector does exist it is declared, so nothing that works today changes.
 CONNECTOR2_NAME="${CONNECTOR2_NAME:-connector-2}"
-CONNECTOR2_URL="${CONNECTOR2_URL:-http://localhost:8081}"
+CONNECTOR2_URL="${CONNECTOR2_URL:-}"
 CONNECTOR2_CLIENT_ID="${CONNECTOR2_CLIENT_ID:-edc-connector-2}"
 CONNECTOR2_CLIENT_SECRET="${CONNECTOR2_CLIENT_SECRET:-}"
 
