@@ -1,0 +1,21 @@
+# Retention for the state-transition log.
+#
+# Ninety days, declared here rather than inherited from whatever the
+# distribution rotates /var/log/nginx with. Req.-BB-PT-011 asks the participant
+# agent to keep these entries; a log that is kept is a log with a period
+# somebody chose.
+/var/log/dataspace/transitions.log {
+    daily
+    rotate 90
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        # nginx holds the file open. Without this it goes on writing to the
+        # rotated inode and the current file stays empty.
+        [ -f /run/nginx.pid ] && kill -USR1 "$(cat /run/nginx.pid)"
+    endscript
+}

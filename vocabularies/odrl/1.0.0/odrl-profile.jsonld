@@ -1,0 +1,31 @@
+{
+  "@context": {
+    "odrl": "http://www.w3.org/ns/odrl/2/",
+    "dct": "http://purl.org/dc/terms/",
+    "myds": "https://www.mydataspace.es/ns#"
+  },
+  "@id": "https://www.mydataspace.es/vocabularies/policies/1.0.0/odrl-profile",
+  "@type": "dct:Standard",
+  "dct:title": "MyDataSpace ODRL policy profile",
+  "dct:hasVersion": "1.0.0",
+  "dct:requires": [
+    "odrl:permission",
+    "odrl:prohibition",
+    "odrl:duty",
+    "myds:purpose",
+    "myds:policyProfile",
+    "myds:classificationKey"
+  ],
+  "myds:controlledActions": [
+    "read",
+    "use",
+    "analyze",
+    "visualize",
+    "download",
+    "attribution",
+    "keep-source-link",
+    "sell",
+    "redistribute",
+    "reidentify"
+  ]
+}

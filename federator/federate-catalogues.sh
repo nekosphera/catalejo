@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env-file)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --env-file requires a path" >&2
+        exit 1
+      fi
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--env-file /path/to/file.env]"
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown argument '$1'" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "${ENV_FILE}" && -f "./tools/fuseki_federation.env" ]]; then
+  ENV_FILE="./tools/fuseki_federation.env"
+fi
+
+if [[ -n "${ENV_FILE}" ]]; then
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "ERROR: env file not found: ${ENV_FILE}" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  set -a
+  source "${ENV_FILE}"
+  set +a
+fi
+
+FUSEKI_BASE_URL="${FUSEKI_BASE_URL:-http://localhost:3030}"
+FUSEKI_DATASET="${FUSEKI_DATASET:-dataspace}"
+GRAPH_BASE_IRI="${GRAPH_BASE_IRI:-urn:dataspace:catalog}"
+FUSEKI_ADMIN_USER="${FUSEKI_ADMIN_USER:-admin}"
+FUSEKI_ADMIN_PASSWORD="${FUSEKI_ADMIN_PASSWORD:-admin}"
+
+KEYCLOAK_URL="${KEYCLOAK_URL:-http://localhost:8089}"
+KEYCLOAK_REALM="${KEYCLOAK_REALM:-dataspace}"
+KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-}"
+KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-}"
+
+CONNECTOR1_NAME="${CONNECTOR1_NAME:-connector-1}"
+CONNECTOR1_URL="${CONNECTOR1_URL:-http://localhost:8080}"
+CONNECTOR1_CLIENT_ID="${CONNECTOR1_CLIENT_ID:-edc-connector}"
+CONNECTOR1_CLIENT_SECRET="${CONNECTOR1_CLIENT_SECRET:-}"
+
+CONNECTOR2_NAME="${CONNECTOR2_NAME:-connector-2}"
+CONNECTOR2_URL="${CONNECTOR2_URL:-http://localhost:8081}"
+CONNECTOR2_CLIENT_ID="${CONNECTOR2_CLIENT_ID:-edc-connector-2}"
+CONNECTOR2_CLIENT_SECRET="${CONNECTOR2_CLIENT_SECRET:-}"
+
+CONNECTOR3_NAME="${CONNECTOR3_NAME:-}"
+CONNECTOR3_URL="${CONNECTOR3_URL:-}"
+CONNECTOR3_CLIENT_ID="${CONNECTOR3_CLIENT_ID:-edc-connector-3}"
+CONNECTOR3_CLIENT_SECRET="${CONNECTOR3_CLIENT_SECRET:-}"
+
+FEDERATION_FETCH_RETRIES="${FEDERATION_FETCH_RETRIES:-5}"
+FEDERATION_FETCH_RETRY_DELAY_SECONDS="${FEDERATION_FETCH_RETRY_DELAY_SECONDS:-1}"
+FEDERATION_PUBLISH_EMPTY_CATALOG="${FEDERATION_PUBLISH_EMPTY_CATALOG:-false}"
+FEDERATION_ENSURE_SERVICE_ACCOUNT_READ_ROLE="${FEDERATION_ENSURE_SERVICE_ACCOUNT_READ_ROLE:-true}"
+FEDERATION_SERVICE_ACCOUNT_READ_ROLE="${FEDERATION_SERVICE_ACCOUNT_READ_ROLE:-dataspace-user}"
+FEDERATION_RUN_ID="${FEDERATION_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+
+for cmd in curl jq sed; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "ERROR: missing dependency '$cmd'" >&2
+    exit 1
+  fi
+done
+
+KEYCLOAK_ADMIN_TOKEN=""
+
+escape_literal() {
+  printf "%s" "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+sparql_update() {
+  local update="$1"
+  curl -fsS -X POST \
+    -u "${FUSEKI_ADMIN_USER}:${FUSEKI_ADMIN_PASSWORD}" \
+    "${FUSEKI_BASE_URL}/${FUSEKI_DATASET}/update" \
+    --data-urlencode "update=${update}" >/dev/null
+}
+
+sparql_select_json() {
+  local query="$1"
+  curl -fsS -X POST \
+    -u "${FUSEKI_ADMIN_USER}:${FUSEKI_ADMIN_PASSWORD}" \
+    -H "Accept: application/sparql-results+json" \
+    "${FUSEKI_BASE_URL}/${FUSEKI_DATASET}/query" \
+    --data-urlencode "query=${query}"
+}
+
+# One line of the model this federator maintains: a subject, a predicate, a
+# value and whether that value is an IRI or a literal. Both the catalog we
+# want and the catalog already stored are expressed this way, so the two can
+# be compared exactly and only the difference has to be written.
+emit_triple() {
+  local subject="$1" predicate="$2" object="$3" kind="$4"
+  jq -cn --arg s "${subject}" --arg p "${predicate}" \
+    --arg o "${object}" --arg t "${kind}" \
+    '{s:$s,p:$p,o:$o,t:$t}' >>"${DESIRED_FILE}"
+}
+
+emit_literal() { emit_triple "$1" "$2" "$3" literal; }
+emit_iri() { emit_triple "$1" "$2" "$3" uri; }
+
+# A literal only when there is something to say. The urn:edc: triples below
+# emit an empty string when a property is absent, which is a value that says
+# "this asset has no title" rather than saying nothing; the standard terms do
+# not repeat that.
+emit_present_literal() {
+  [[ -n "$3" ]] || return 0
+  emit_triple "$1" "$2" "$3" literal
+}
+
+# The vocabularies the catalogue is read with, rather than the URN scheme it
+# was written with.
+#
+# The asset properties arrive DCAT-keyed from the connector - the reader below
+# already looks for properties["dcat:keyword"] and properties["dcat:mediaType"]
+# - and were then buried in urn:edc: predicates invented here. Only two of the
+# terms this federator wrote were standard. Req.-BB-DSO-008 of the DSSC
+# Catalogue self-assessment asks for standardised metadata vocabularies, and a
+# private URN scheme is not one; Req.-BB-DSO-001 asks for descriptions managed
+# in DCAT, which the publication side already does.
+#
+# Both halves are written for now. ui/app.js queries `PREFIX edc: <urn:edc:>`,
+# so removing the URNs would blank the console; they are the deprecated half
+# and go when that query moves.
+RDF_TYPE="http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+DCAT_NS="http://www.w3.org/ns/dcat#"
+DCT_NS="http://purl.org/dc/terms/"
+MYDS_NS="https://www.mydataspace.es/ns#"
+
+drop_orphan_sync_graphs() {
+  # Earlier versions staged each run in <graph>/.sync-<run id> and swapped it
+  # in. A run that died between the swap steps left its staging graph behind,
+  # where it still answers catalog queries and double counts assets. Nothing
+  # creates them any more; these are the leftovers.
+  local graph_iri="$1" orphan
+  while IFS= read -r orphan; do
+    [[ -z "${orphan}" ]] && continue
+    echo "[federator] dropping orphaned staging graph <${orphan}>" >&2
+    sparql_update "DROP SILENT GRAPH <${orphan}>"
+  done < <(
+    sparql_select_json "
+      SELECT DISTINCT ?g WHERE {
+        GRAPH ?g { ?s ?p ?o }
+        FILTER(STRSTARTS(STR(?g), \"${graph_iri}/.sync-\"))
+      }" | jq -r '.results.bindings[].g.value'
+  )
+}
+
+# Write only what changed.
+#
+# This federator used to rebuild the catalog on every run: it staged a
+# complete copy in a temporary graph, dropped the live graph and copied the
+# staged one over it, once every FEDERATION_INTERVAL_SECONDS. TDB2 is
+# append-only and reclaims nothing until it is compacted, so a catalog of a
+# few hundred triples that never changed still grew the store by megabytes an
+# hour. Measured on three participants in August 2026, that had reached 17 GB
+# for 371 triples on one of them and 10 GB for 1165 on another, on hosts whose
+# root filesystem was 80 % full.
+#
+# So: compare what the connector reports against what is stored, and issue a
+# single update carrying just the difference. When nothing changed - the usual
+# case - nothing is written at all, and the store stops growing.
+sync_graph() {
+  local graph_iri="$1" connector_name="$2" connector_url="$3"
+  local assets_count="$4" policies_count="$5" contracts_count="$6"
+  local marker_uri="${graph_iri}/sync"
+
+  drop_orphan_sync_graphs "${graph_iri}"
+
+  local current_file to_insert to_delete
+  current_file="$(mktemp)"
+  to_insert="$(mktemp)"
+  to_delete="$(mktemp)"
+
+  # The marker carries the run's own timestamp, so it is compared separately:
+  # included in the comparison it would differ on every run and defeat the
+  # whole point.
+  sparql_select_json "
+    SELECT ?s ?p ?o WHERE {
+      GRAPH <${graph_iri}> { ?s ?p ?o }
+      FILTER(STR(?s) != \"${marker_uri}\")
+    }" |
+    jq -c '.results.bindings[]
+      | {s:.s.value, p:.p.value, o:.o.value,
+         t:(if .o.type == "uri" then "uri" else "literal" end)}' \
+      >"${current_file}"
+
+  if grep -q '"s":"_:' "${current_file}"; then
+    echo "[federator] WARN ${connector_name}: <${graph_iri}> holds blank nodes, which this federator cannot express; leaving it untouched" >&2
+    rm -f "${current_file}" "${to_insert}" "${to_delete}"
+    return
+  fi
+
+  sort -u "${DESIRED_FILE}" >"${DESIRED_FILE}.sorted"
+  sort -u "${current_file}" >"${current_file}.sorted"
+  comm -13 "${current_file}.sorted" "${DESIRED_FILE}.sorted" >"${to_insert}"
+  comm -23 "${current_file}.sorted" "${DESIRED_FILE}.sorted" >"${to_delete}"
+
+  local inserted removed
+  inserted=$(wc -l <"${to_insert}")
+  removed=$(wc -l <"${to_delete}")
+
+  if [[ "${inserted}" -eq 0 && "${removed}" -eq 0 ]]; then
+    echo "Unchanged ${connector_name}: assets=${assets_count}, policies=${policies_count}, contracts=${contracts_count}; nothing written"
+    rm -f "${current_file}" "${current_file}.sorted" "${DESIRED_FILE}.sorted" \
+      "${to_insert}" "${to_delete}"
+    return
+  fi
+
+  local changed_at
+  changed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local update="DELETE WHERE { GRAPH <${graph_iri}> { <${marker_uri}> ?p ?o } } ;"
+  if [[ "${removed}" -gt 0 ]]; then
+    update="${update}
+DELETE DATA { GRAPH <${graph_iri}> {
+$(render_triple <"${to_delete}")
+} } ;"
+  fi
+  update="${update}
+INSERT DATA { GRAPH <${graph_iri}> {
+$(render_triple <"${to_insert}")
+<${marker_uri}> <urn:edc:connector> \"$(escape_literal "${connector_name}")\" .
+<${marker_uri}> <urn:edc:sourceUrl> \"$(escape_literal "${connector_url}")\" .
+<${marker_uri}> <urn:edc:lastChangedAt> \"${changed_at}\" .
+<${marker_uri}> <urn:edc:assets> \"${assets_count}\" .
+<${marker_uri}> <urn:edc:policies> \"${policies_count}\" .
+<${marker_uri}> <urn:edc:contracts> \"${contracts_count}\" .
+<${marker_uri}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:edc:CatalogSync> .
+} }"
+
+  sparql_update "${update}"
+  echo "Ingested ${connector_name}: assets=${assets_count}, policies=${policies_count}, contracts=${contracts_count}; +${inserted} -${removed} triples"
+  # Which ones, by subject and predicate. A run that keeps reporting the same
+  # difference is not converging, and a count alone cannot say why. Objects are
+  # left out: the catalog is public but the log does not need to carry it.
+  if [[ "${FEDERATION_LOG_CHANGES:-true}" == true ]]; then
+    jq -r '"  + \(.s) \(.p)"' <"${to_insert}" | head -20
+    jq -r '"  - \(.s) \(.p)"' <"${to_delete}" | head -20
+  fi
+  rm -f "${current_file}" "${current_file}.sorted" "${DESIRED_FILE}.sorted" \
+    "${to_insert}" "${to_delete}"
+}
+
+render_triple() {
+  # Reads one model line on stdin and prints it as a SPARQL triple pattern.
+  jq -r '
+    if .t == "uri" then "<\(.s)> <\(.p)> <\(.o)> ."
+    else "<\(.s)> <\(.p)> \"\(.o | gsub("\\\\"; "\\\\") | gsub("\""; "\\\"")
+      | gsub("\n"; "\\n") | gsub("\r"; "\\r") | gsub("\t"; "\\t"))\" ."
+    end'
+}
+
+normalize_positive_int() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "${value}" =~ ^[0-9]+$ ]] && [[ "${value}" -gt 0 ]]; then
+    echo "${value}"
+  else
+    echo "${fallback}"
+  fi
+}
+
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|y|Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+FEDERATION_FETCH_RETRIES="$(normalize_positive_int "${FEDERATION_FETCH_RETRIES}" 5)"
+FEDERATION_FETCH_RETRY_DELAY_SECONDS="$(normalize_positive_int "${FEDERATION_FETCH_RETRY_DELAY_SECONDS}" 1)"
+
+ensure_dataset() {
+  local datasets_json
+  datasets_json=$(curl -fsS -u "${FUSEKI_ADMIN_USER}:${FUSEKI_ADMIN_PASSWORD}" "${FUSEKI_BASE_URL}/\$/datasets")
+  if echo "${datasets_json}" | grep -q "\"/${FUSEKI_DATASET}\""; then
+    return
+  fi
+
+  curl -fsS -X POST \
+    -u "${FUSEKI_ADMIN_USER}:${FUSEKI_ADMIN_PASSWORD}" \
+    "${FUSEKI_BASE_URL}/\$/datasets" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data "dbType=tdb2&dbName=${FUSEKI_DATASET}" >/dev/null
+}
+
+keycloak_get_admin_token() {
+  if [[ -n "${KEYCLOAK_ADMIN_TOKEN}" ]]; then
+    echo "${KEYCLOAK_ADMIN_TOKEN}"
+    return
+  fi
+
+  if [[ -z "${KEYCLOAK_ADMIN_USER}" || -z "${KEYCLOAK_ADMIN_PASSWORD}" ]]; then
+    echo ""
+    return
+  fi
+
+  local resp token
+  resp=$(curl -sS -X POST \
+    "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'grant_type=password' \
+    --data-urlencode 'client_id=admin-cli' \
+    --data-urlencode "username=${KEYCLOAK_ADMIN_USER}" \
+    --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}" || true)
+
+  token=$(echo "${resp}" | jq -r '.access_token // empty')
+  if [[ -z "${token}" ]]; then
+    echo ""
+    return
+  fi
+
+  KEYCLOAK_ADMIN_TOKEN="${token}"
+  echo "${KEYCLOAK_ADMIN_TOKEN}"
+}
+
+keycloak_get_client_secret() {
+  local client_id="$1"
+  local admin_token client_query client_internal_id secret_resp secret
+
+  admin_token=$(keycloak_get_admin_token)
+  if [[ -z "${admin_token}" ]]; then
+    echo ""
+    return
+  fi
+
+  client_query=$(curl -sS \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${KEYCLOAK_URL}/admin/realms/${KEYCLOAK_REALM}/clients?clientId=${client_id}" || true)
+
+  client_internal_id=$(echo "${client_query}" | jq -r '.[0].id // empty')
+  if [[ -z "${client_internal_id}" ]]; then
+    echo ""
+    return
+  fi
+
+  secret_resp=$(curl -sS \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${KEYCLOAK_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${client_internal_id}/client-secret" || true)
+
+  secret=$(echo "${secret_resp}" | jq -r '.value // empty')
+  echo "${secret}"
+}
+
+keycloak_ensure_service_account_read_role() {
+  local client_id="$1"
+  local admin_token client_query client_internal_id service_account role_repr status
+
+  if ! is_truthy "${FEDERATION_ENSURE_SERVICE_ACCOUNT_READ_ROLE}"; then
+    return
+  fi
+
+  admin_token=$(keycloak_get_admin_token)
+  if [[ -z "${admin_token}" ]]; then
+    return
+  fi
+
+  client_query=$(curl -sS \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${KEYCLOAK_URL}/admin/realms/${KEYCLOAK_REALM}/clients?clientId=${client_id}" || true)
+
+  client_internal_id=$(echo "${client_query}" | jq -r '.[0].id // empty')
+  if [[ -z "${client_internal_id}" ]]; then
+    echo "[federator] WARN Keycloak client '${client_id}' not found; cannot ensure service-account role" >&2
+    return
+  fi
+
+  service_account=$(curl -sS \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${KEYCLOAK_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${client_internal_id}/service-account-user" || true)
+
+  local service_account_id
+  service_account_id=$(echo "${service_account}" | jq -r '.id // empty')
+  if [[ -z "${service_account_id}" ]]; then
+    echo "[federator] WARN Keycloak client '${client_id}' has no service account; cannot ensure read role" >&2
+    return
+  fi
+
+  role_repr=$(curl -sS \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${KEYCLOAK_URL}/admin/realms/${KEYCLOAK_REALM}/roles/${FEDERATION_SERVICE_ACCOUNT_READ_ROLE}" || true)
+
+  if ! echo "${role_repr}" | jq -e '.id and .name' >/dev/null 2>&1; then
+    echo "[federator] WARN Keycloak role '${FEDERATION_SERVICE_ACCOUNT_READ_ROLE}' not found; cannot ensure service-account role" >&2
+    return
+  fi
+
+  status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${admin_token}" \
+    -H 'Content-Type: application/json' \
+    -d "[${role_repr}]" \
+    "${KEYCLOAK_URL}/admin/realms/${KEYCLOAK_REALM}/users/${service_account_id}/role-mappings/realm" || true)
+
+  if [[ "${status}" != "204" && "${status}" != "409" ]]; then
+    echo "[federator] WARN could not ensure '${FEDERATION_SERVICE_ACCOUNT_READ_ROLE}' for '${client_id}' service account (HTTP ${status})" >&2
+  fi
+}
+
+keycloak_get_client_token() {
+  local client_id="$1"
+  local client_secret="$2"
+  local token_resp token
+
+  token_resp=$(curl -sS -X POST \
+    "${KEYCLOAK_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'grant_type=client_credentials' \
+    --data-urlencode "client_id=${client_id}" \
+    --data-urlencode "client_secret=${client_secret}" || true)
+
+  token=$(echo "${token_resp}" | jq -r '.access_token // empty')
+  echo "${token}"
+}
+
+fetch_connector_json_to_file() {
+  local base_url="$1"
+  local bearer_token="$2"
+  local path="$3"
+  local output_file="$4"
+
+  local response body status
+  local attempt=0
+
+  while [[ ${attempt} -lt "${FEDERATION_FETCH_RETRIES}" ]]; do
+    response=$(curl -sS \
+      -H "Authorization: Bearer ${bearer_token}" \
+      -w $'\nHTTP_STATUS:%{http_code}' \
+      "${base_url}${path}" || true)
+
+    body=$(printf "%s" "${response}" | sed '$d')
+    status=$(printf "%s" "${response}" | sed -n '$s/^HTTP_STATUS://p')
+
+    if [[ "${status}" == "200" ]]; then
+      if echo "${body}" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        printf "%s" "${body}" > "${output_file}"
+        return 0
+      fi
+      echo "[federator] WARN ${base_url}${path} returned non-array JSON; keeping previous graph" >&2
+      printf "[]" > "${output_file}"
+      return 11
+    fi
+
+    if [[ "${status}" == "401" || "${status}" == "403" ]]; then
+      echo "[federator] WARN ${base_url}${path} returned ${status} (auth/roles)" >&2
+      printf "[]" > "${output_file}"
+      return 10
+    fi
+
+    attempt=$((attempt + 1))
+    if [[ ${attempt} -lt "${FEDERATION_FETCH_RETRIES}" ]]; then
+      sleep "${FEDERATION_FETCH_RETRY_DELAY_SECONDS}"
+    fi
+  done
+
+  echo "[federator] WARN ${base_url}${path} unreachable after retries" >&2
+  printf "[]" > "${output_file}"
+  return 12
+}
+
+ingest_connector() {
+  local connector_name="$1"
+  local connector_url="$2"
+  local connector_client_id="$3"
+  local connector_client_secret="$4"
+
+  if [[ -z "${connector_name}" || -z "${connector_url}" ]]; then
+    return
+  fi
+
+  if [[ -z "${connector_client_secret}" ]]; then
+    connector_client_secret=$(keycloak_get_client_secret "${connector_client_id}")
+  fi
+
+  if [[ -z "${connector_client_secret}" ]]; then
+    echo "[federator] WARN missing client secret for ${connector_name} (${connector_client_id}); skipping" >&2
+    return
+  fi
+
+  keycloak_ensure_service_account_read_role "${connector_client_id}"
+
+  local connector_token
+  connector_token=$(keycloak_get_client_token "${connector_client_id}" "${connector_client_secret}")
+  if [[ -z "${connector_token}" ]]; then
+    echo "[federator] WARN cannot obtain token for ${connector_name} (${connector_client_id}); skipping" >&2
+    return
+  fi
+
+  local graph_iri="${GRAPH_BASE_IRI}/${connector_name}"
+  local assets_file policies_file contracts_file
+  assets_file="$(mktemp)"
+  policies_file="$(mktemp)"
+  contracts_file="$(mktemp)"
+  # The catalog this run wants, built locally. Nothing reaches Fuseki until
+  # it has been compared with what is already there.
+  DESIRED_FILE="$(mktemp)"
+
+  local assets_status=0
+  local policies_status=0
+  local contracts_status=0
+  fetch_connector_json_to_file "${connector_url}" "${connector_token}" "/management/v3/assets" "${assets_file}" || assets_status=$?
+  fetch_connector_json_to_file "${connector_url}" "${connector_token}" "/management/v3/policydefinitions" "${policies_file}" || policies_status=$?
+  fetch_connector_json_to_file "${connector_url}" "${connector_token}" "/management/v3/contractdefinitions" "${contracts_file}" || contracts_status=$?
+
+  if [[ "${assets_status}" -ne 0 || "${policies_status}" -ne 0 || "${contracts_status}" -ne 0 ]]; then
+    echo "[federator] WARN ${connector_name}: incomplete sync (assets=${assets_status}, policies=${policies_status}, contracts=${contracts_status}); keeping previous graph <${graph_iri}>" >&2
+    rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
+    return
+  fi
+
+  local assets_count=0
+  local policies_count=0
+  local contracts_count=0
+
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    local asset_id name base_url description language publisher license_url access_rights theme keywords media_type delivery_mode
+    asset_id=$(echo "${row}" | jq -r '.id // .["@id"] // empty')
+    [[ -z "${asset_id}" ]] && continue
+    name=$(echo "${row}" | jq -r '.properties["dct:title"] // .properties.name // empty')
+    base_url=$(echo "${row}" | jq -r '.properties.objectUrl // .dataAddress.baseUrl // empty')
+    description=$(echo "${row}" | jq -r '.properties["dct:description"] // .properties.description // empty')
+    language=$(echo "${row}" | jq -r '.properties["dct:language"] // .properties.language // empty')
+    publisher=$(echo "${row}" | jq -r '.properties["dct:publisher"] // .properties.publisher // empty')
+    license_url=$(echo "${row}" | jq -r '.properties["dct:license"] // .properties.licenseUrl // .properties.license // empty')
+    access_rights=$(echo "${row}" | jq -r '.properties["dct:accessRights"] // .properties.accessRights // empty')
+    theme=$(echo "${row}" | jq -r '.properties["dcat:theme"] // .properties.theme // empty')
+    keywords=$(echo "${row}" | jq -r 'if (.properties["dcat:keyword"] // .properties.keywords) | type == "array" then (.properties["dcat:keyword"] // .properties.keywords | join(", ")) else (.properties["dcat:keyword"] // .properties.keywords // empty) end')
+    media_type=$(echo "${row}" | jq -r '.properties["dcat:mediaType"] // .properties.contenttype // .properties.contentType // empty')
+    delivery_mode=$(echo "${row}" | jq -r '.properties["myds:deliveryMode"] // .properties.deliveryMode // empty')
+
+    local asset_uri
+    asset_uri="urn:dataspace:${connector_name}:asset:${asset_id}"
+
+    emit_iri "${asset_uri}" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "urn:edc:Asset"
+    emit_literal "${asset_uri}" "urn:edc:assetId" "${asset_id}"
+    emit_literal "${asset_uri}" "urn:edc:connector" "${connector_name}"
+    emit_literal "${asset_uri}" "urn:edc:name" "${name}"
+    emit_literal "${asset_uri}" "urn:edc:description" "${description}"
+    emit_literal "${asset_uri}" "urn:edc:language" "${language}"
+    emit_literal "${asset_uri}" "urn:edc:publisher" "${publisher}"
+    emit_literal "${asset_uri}" "urn:edc:licenseUrl" "${license_url}"
+    emit_literal "${asset_uri}" "urn:edc:accessRights" "${access_rights}"
+    emit_literal "${asset_uri}" "urn:edc:theme" "${theme}"
+    emit_literal "${asset_uri}" "urn:edc:keywords" "${keywords}"
+    emit_literal "${asset_uri}" "urn:edc:mediaType" "${media_type}"
+    emit_literal "${asset_uri}" "urn:edc:deliveryMode" "${delivery_mode}"
+    emit_literal "${asset_uri}" "urn:edc:baseUrl" "${base_url}"
+
+    # The same asset, in DCAT. These are the terms the shapes in
+    # generated/vocabularies/dcat-ap-mydataspace/1.0.0/shapes.ttl target, so
+    # the federated graph is now describable by the same profile the
+    # publication side validates against.
+    emit_iri "${asset_uri}" "${RDF_TYPE}" "${DCAT_NS}Dataset"
+    emit_present_literal "${asset_uri}" "${DCT_NS}identifier" "${asset_id}"
+    emit_present_literal "${asset_uri}" "${DCT_NS}title" "${name}"
+    emit_present_literal "${asset_uri}" "${DCT_NS}description" "${description}"
+    emit_present_literal "${asset_uri}" "${DCT_NS}language" "${language}"
+    emit_present_literal "${asset_uri}" "${DCT_NS}publisher" "${publisher}"
+    emit_present_literal "${asset_uri}" "${DCT_NS}accessRights" "${access_rights}"
+    emit_present_literal "${asset_uri}" "${DCAT_NS}theme" "${theme}"
+    emit_present_literal "${asset_uri}" "${DCAT_NS}mediaType" "${media_type}"
+    emit_present_literal "${asset_uri}" "${MYDS_NS}deliveryMode" "${delivery_mode}"
+    if [[ "${license_url}" == http://* || "${license_url}" == https://* ]]; then
+      emit_iri "${asset_uri}" "${DCT_NS}license" "${license_url}"
+    else
+      emit_present_literal "${asset_uri}" "${DCT_NS}license" "${license_url}"
+    fi
+
+    # One keyword per triple. They arrive joined for the URN half, which is
+    # why dcat:keyword could never have been a straight rename.
+    if [[ -n "${keywords}" ]]; then
+      local keyword
+      while IFS= read -r keyword; do
+        keyword="${keyword#"${keyword%%[![:space:]]*}"}"
+        keyword="${keyword%"${keyword##*[![:space:]]}"}"
+        [[ -n "${keyword}" ]] || continue
+        emit_literal "${asset_uri}" "${DCAT_NS}keyword" "${keyword}"
+      # With no trailing newline the last keyword is read and dropped.
+      done < <(printf '%s\n' "${keywords}" | tr ',' "\n")
+    fi
+
+    # Where the data is actually obtained. dcat:accessURL belongs to a
+    # distribution, not to the dataset, and Req.-BB-DSO-005 asks the catalogue
+    # to carry the means of access.
+    if [[ "${base_url}" == http://* || "${base_url}" == https://* ]]; then
+      local distribution_uri="${asset_uri}:distribution"
+      emit_iri "${asset_uri}" "${DCAT_NS}distribution" "${distribution_uri}"
+      emit_iri "${distribution_uri}" "${RDF_TYPE}" "${DCAT_NS}Distribution"
+      emit_iri "${distribution_uri}" "${DCAT_NS}accessURL" "${base_url}"
+      emit_present_literal "${distribution_uri}" "${DCAT_NS}mediaType" "${media_type}"
+    fi
+    assets_count=$((assets_count + 1))
+  done < <(jq -c 'if type=="array" then .[] else empty end' "${assets_file}")
+
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    local policy_id policy_name license_url
+    policy_id=$(echo "${row}" | jq -r '.id // .["@id"] // empty')
+    [[ -z "${policy_id}" ]] && continue
+    policy_name=$(echo "${row}" | jq -r '.policy.name // .policy.title // empty')
+    license_url=$(echo "${row}" | jq -r '.policy.licenseUrl // .policy.license.url // empty')
+
+    local policy_uri
+    policy_uri="urn:dataspace:${connector_name}:policy:${policy_id}"
+
+    emit_iri "${policy_uri}" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "urn:edc:Policy"
+    emit_literal "${policy_uri}" "urn:edc:policyId" "${policy_id}"
+    emit_literal "${policy_uri}" "urn:edc:connector" "${connector_name}"
+    emit_literal "${policy_uri}" "urn:edc:policyName" "${policy_name}"
+    emit_literal "${policy_uri}" "urn:edc:licenseUrl" "${license_url}"
+    policies_count=$((policies_count + 1))
+  done < <(jq -c 'if type=="array" then .[] else empty end' "${policies_file}")
+
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    local contract_id access_policy_id contract_policy_id selected_asset_id
+    contract_id=$(echo "${row}" | jq -r '.id // .["@id"] // empty')
+    [[ -z "${contract_id}" ]] && continue
+    access_policy_id=$(echo "${row}" | jq -r '.accessPolicyId // empty')
+    contract_policy_id=$(echo "${row}" | jq -r '.contractPolicyId // empty')
+    selected_asset_id=$(echo "${row}" | jq -r '.assetsSelector[]? | select((.leftOperand=="id") or (.operandLeft=="https://w3id.org/edc/v0.0.1/ns/id")) | (.rightOperand // .operandRight // empty)' | head -n1)
+
+    local contract_uri access_policy_uri contract_policy_uri selected_asset_uri
+    contract_uri="urn:dataspace:${connector_name}:contract:${contract_id}"
+    access_policy_uri="urn:dataspace:${connector_name}:policy:${access_policy_id}"
+    contract_policy_uri="urn:dataspace:${connector_name}:policy:${contract_policy_id}"
+    selected_asset_uri="urn:dataspace:${connector_name}:asset:${selected_asset_id}"
+
+    emit_iri "${contract_uri}" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "urn:edc:ContractDefinition"
+    emit_literal "${contract_uri}" "urn:edc:contractId" "${contract_id}"
+    emit_iri "${contract_uri}" "urn:edc:accessPolicy" "${access_policy_uri}"
+    emit_iri "${contract_uri}" "urn:edc:contractPolicy" "${contract_policy_uri}"
+    emit_iri "${contract_uri}" "urn:edc:asset" "${selected_asset_uri}"
+    emit_literal "${contract_uri}" "urn:edc:connector" "${connector_name}"
+    contracts_count=$((contracts_count + 1))
+  done < <(jq -c 'if type=="array" then .[] else empty end' "${contracts_file}")
+
+  if [[ "${assets_count}" -eq 0 ]] && ! is_truthy "${FEDERATION_PUBLISH_EMPTY_CATALOG}"; then
+    echo "[federator] WARN ${connector_name}: fetched zero assets; keeping previous graph <${graph_iri}> (set FEDERATION_PUBLISH_EMPTY_CATALOG=true to publish empty catalogs)" >&2
+    rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
+    return
+  fi
+
+  sync_graph "${graph_iri}" "${connector_name}" "${connector_url}" \
+    "${assets_count}" "${policies_count}" "${contracts_count}"
+
+  rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
+}
+
+main() {
+  ensure_dataset
+  ingest_connector "${CONNECTOR1_NAME}" "${CONNECTOR1_URL}" "${CONNECTOR1_CLIENT_ID}" "${CONNECTOR1_CLIENT_SECRET}"
+  ingest_connector "${CONNECTOR2_NAME}" "${CONNECTOR2_URL}" "${CONNECTOR2_CLIENT_ID}" "${CONNECTOR2_CLIENT_SECRET}"
+  if [[ -n "${CONNECTOR3_NAME}" && -n "${CONNECTOR3_URL}" ]]; then
+    ingest_connector "${CONNECTOR3_NAME}" "${CONNECTOR3_URL}" "${CONNECTOR3_CLIENT_ID}" "${CONNECTOR3_CLIENT_SECRET}"
+  fi
+
+  echo "Done. Fuseki dataset: ${FUSEKI_DATASET}"
+  echo "SPARQL endpoint: ${FUSEKI_BASE_URL}/${FUSEKI_DATASET}/query"
+  echo "Example query:"
+  echo "  SELECT ?connector ?assetId ?name WHERE {"
+  echo "    GRAPH ?g {"
+  echo "      ?a <urn:edc:connector> ?connector ;"
+  echo "         <urn:edc:assetId> ?assetId ;"
+  echo "         <urn:edc:name> ?name ."
+  echo "    }"
+  echo "  } ORDER BY ?connector ?assetId"
+}
+
+# Sourcing the script exposes its functions without federating anything, so
+# the delta logic can be exercised directly by the tests.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
