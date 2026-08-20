@@ -1,0 +1,43 @@
+name: smoke
+
+# The proof the published bundle works, run where anybody can see it.
+#
+# smoke.sh has always existed and has always been run inside nekosphera's own
+# repository, which is private: the public catalogue repository carried a
+# quickstart in its README and nothing that demonstrated the quickstart is
+# true. A visitor evaluating this project could read the claim and had no way
+# to check it.
+#
+# This file is published from catalogue/ci/catalejo-smoke.yml through
+# catalogue/bundle.json, like everything else in the bundle. Editing it in the
+# published repository is pointless: the next publication overwrites it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a bundle that stops working is noticed without a push.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The tools the smoke test says it needs
+        run: |
+          set -Eeuo pipefail
+          for tool in docker python3 curl jq; do
+            command -v "$tool" >/dev/null || { echo "::error::missing $tool"; exit 1; }
+          done
+      - name: Prove the quickstart
+        run: ./smoke.sh
