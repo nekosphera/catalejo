@@ -86,6 +86,17 @@ done
 
 KEYCLOAK_ADMIN_TOKEN=""
 
+# What each declared connector turned out to contribute. Every run already knew
+# this and said it one line at a time, so a connector that stopped publishing
+# read exactly like one that never did - and connector-2 has been fetching zero
+# assets on all three domains for as long as there are logs, in a WARN nobody
+# reads. Reconciled at the end of the run instead, in one line, against what
+# was declared.
+FEDERATION_DECLARED=()
+FEDERATION_CONTRIBUTING=()
+FEDERATION_EMPTY=()
+FEDERATION_UNAVAILABLE=()
+
 escape_literal() {
   printf "%s" "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
@@ -495,6 +506,10 @@ ingest_connector() {
   if [[ -z "${connector_name}" || -z "${connector_url}" ]]; then
     return
   fi
+  # Declared here rather than in main: a connector without a URL is not
+  # declared at all, and counting it would make an unconfigured deployment
+  # look like a broken one.
+  FEDERATION_DECLARED+=("${connector_name}")
 
   if [[ -z "${connector_client_secret}" ]]; then
     connector_client_secret=$(keycloak_get_client_secret "${connector_client_id}")
@@ -502,6 +517,7 @@ ingest_connector() {
 
   if [[ -z "${connector_client_secret}" ]]; then
     echo "[federator] WARN missing client secret for ${connector_name} (${connector_client_id}); skipping" >&2
+    FEDERATION_UNAVAILABLE+=("${connector_name}")
     return
   fi
 
@@ -672,9 +688,11 @@ ingest_connector() {
   if [[ "${assets_count}" -eq 0 ]] && ! is_truthy "${FEDERATION_PUBLISH_EMPTY_CATALOG}"; then
     echo "[federator] WARN ${connector_name}: fetched zero assets; keeping previous graph <${graph_iri}> (set FEDERATION_PUBLISH_EMPTY_CATALOG=true to publish empty catalogs)" >&2
     rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
+    FEDERATION_EMPTY+=("${connector_name}")
     return
   fi
 
+  FEDERATION_CONTRIBUTING+=("${connector_name}")
   sync_graph "${graph_iri}" "${connector_name}" "${connector_url}" \
     "${assets_count}" "${policies_count}" "${contracts_count}"
 
@@ -682,12 +700,32 @@ ingest_connector() {
 }
 
 main() {
+  local connector_name outcome empty unavailable
   ensure_dataset
   ingest_connector "${CONNECTOR1_NAME}" "${CONNECTOR1_URL}" "${CONNECTOR1_CLIENT_ID}" "${CONNECTOR1_CLIENT_SECRET}"
   ingest_connector "${CONNECTOR2_NAME}" "${CONNECTOR2_URL}" "${CONNECTOR2_CLIENT_ID}" "${CONNECTOR2_CLIENT_SECRET}"
   if [[ -n "${CONNECTOR3_NAME}" && -n "${CONNECTOR3_URL}" ]]; then
     ingest_connector "${CONNECTOR3_NAME}" "${CONNECTOR3_URL}" "${CONNECTOR3_CLIENT_ID}" "${CONNECTOR3_CLIENT_SECRET}"
   fi
+
+  # One line that can be compared with the registry. A connector declared here
+  # and contributing nothing is either a connector with nothing to publish -
+  # which is a fact about the deployment, not a fault - or one that has stopped
+  # publishing. Both need saying; only the reader can tell them apart, and the
+  # reader could not see either before.
+  printf 'federation_summary declared=%s contributing=%s empty=%s unavailable=%s
+'     "${#FEDERATION_DECLARED[@]}" "${#FEDERATION_CONTRIBUTING[@]}"     "${#FEDERATION_EMPTY[@]}" "${#FEDERATION_UNAVAILABLE[@]}"
+  for connector_name in "${FEDERATION_DECLARED[@]}"; do
+    outcome=contributing
+    for empty in "${FEDERATION_EMPTY[@]:-}"; do
+      [[ "${empty}" == "${connector_name}" ]] && outcome=empty
+    done
+    for unavailable in "${FEDERATION_UNAVAILABLE[@]:-}"; do
+      [[ "${unavailable}" == "${connector_name}" ]] && outcome=unavailable
+    done
+    printf 'federation_connector=%s outcome=%s
+' "${connector_name}" "${outcome}"
+  done
 
   echo "Done. Fuseki dataset: ${FUSEKI_DATASET}"
   echo "SPARQL endpoint: ${FUSEKI_BASE_URL}/${FUSEKI_DATASET}/query"
