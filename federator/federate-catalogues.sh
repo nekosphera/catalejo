@@ -53,6 +53,10 @@ CONNECTOR1_NAME="${CONNECTOR1_NAME:-connector-1}"
 CONNECTOR1_URL="${CONNECTOR1_URL:-http://localhost:8080}"
 CONNECTOR1_CLIENT_ID="${CONNECTOR1_CLIENT_ID:-edc-connector}"
 CONNECTOR1_CLIENT_SECRET="${CONNECTOR1_CLIENT_SECRET:-}"
+# What each connector is for. A connector that consumes is not a provider that
+# failed, and the two were indistinguishable in the count. Overridable per
+# deployment, because a role is a declaration and declarations change.
+CONNECTOR1_ROLE="${CONNECTOR1_ROLE:-provider}"
 
 # No URL default, the same shape as the third connector below: a deployment
 # that declares one connector has one connector. Inventing a second one at
@@ -64,11 +68,17 @@ CONNECTOR2_NAME="${CONNECTOR2_NAME:-connector-2}"
 CONNECTOR2_URL="${CONNECTOR2_URL:-}"
 CONNECTOR2_CLIENT_ID="${CONNECTOR2_CLIENT_ID:-edc-connector-2}"
 CONNECTOR2_CLIENT_SECRET="${CONNECTOR2_CLIENT_SECRET:-}"
+# consumer, on all three domains. Its registry entry is consumer-only with
+# capabilities ["consume"], so publishing nothing is what it is for - and the
+# summary below used to count that as an empty provider, which reads as a
+# federation missing a participant every single run.
+CONNECTOR2_ROLE="${CONNECTOR2_ROLE:-consumer}"
 
 CONNECTOR3_NAME="${CONNECTOR3_NAME:-}"
 CONNECTOR3_URL="${CONNECTOR3_URL:-}"
 CONNECTOR3_CLIENT_ID="${CONNECTOR3_CLIENT_ID:-edc-connector-3}"
 CONNECTOR3_CLIENT_SECRET="${CONNECTOR3_CLIENT_SECRET:-}"
+CONNECTOR3_ROLE="${CONNECTOR3_ROLE:-provider}"
 
 FEDERATION_FETCH_RETRIES="${FEDERATION_FETCH_RETRIES:-5}"
 FEDERATION_FETCH_RETRY_DELAY_SECONDS="${FEDERATION_FETCH_RETRY_DELAY_SECONDS:-1}"
@@ -96,6 +106,7 @@ FEDERATION_DECLARED=()
 FEDERATION_CONTRIBUTING=()
 FEDERATION_EMPTY=()
 FEDERATION_UNAVAILABLE=()
+FEDERATION_PROVIDERS=()
 
 escape_literal() {
   printf "%s" "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
@@ -502,6 +513,7 @@ ingest_connector() {
   local connector_url="$2"
   local connector_client_id="$3"
   local connector_client_secret="$4"
+  local connector_role="${5:-provider}"
 
   if [[ -z "${connector_name}" || -z "${connector_url}" ]]; then
     return
@@ -510,6 +522,7 @@ ingest_connector() {
   # declared at all, and counting it would make an unconfigured deployment
   # look like a broken one.
   FEDERATION_DECLARED+=("${connector_name}")
+  [[ "${connector_role}" == "provider" ]] && FEDERATION_PROVIDERS+=("${connector_name}")
 
   if [[ -z "${connector_client_secret}" ]]; then
     connector_client_secret=$(keycloak_get_client_secret "${connector_client_id}")
@@ -686,9 +699,18 @@ ingest_connector() {
   done < <(jq -c 'if type=="array" then .[] else empty end' "${contracts_file}")
 
   if [[ "${assets_count}" -eq 0 ]] && ! is_truthy "${FEDERATION_PUBLISH_EMPTY_CATALOG}"; then
-    echo "[federator] WARN ${connector_name}: fetched zero assets; keeping previous graph <${graph_iri}> (set FEDERATION_PUBLISH_EMPTY_CATALOG=true to publish empty catalogs)" >&2
+    if [[ "${connector_role}" == "provider" ]]; then
+      echo "[federator] WARN ${connector_name}: fetched zero assets; keeping previous graph <${graph_iri}> (set FEDERATION_PUBLISH_EMPTY_CATALOG=true to publish empty catalogs)" >&2
+    else
+      echo "[federator] ${connector_name}: consumer, nothing to publish" >&2
+    fi
     rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
-    FEDERATION_EMPTY+=("${connector_name}")
+    # Only a provider can be empty. A consumer fetching zero assets is doing
+    # what it is for, and counting it as an anomaly is how every run of this
+    # federation reported a missing participant that was never missing.
+    if [[ "${connector_role}" == "provider" ]]; then
+      FEDERATION_EMPTY+=("${connector_name}")
+    fi
     return
   fi
 
@@ -702,10 +724,10 @@ ingest_connector() {
 main() {
   local connector_name outcome empty unavailable
   ensure_dataset
-  ingest_connector "${CONNECTOR1_NAME}" "${CONNECTOR1_URL}" "${CONNECTOR1_CLIENT_ID}" "${CONNECTOR1_CLIENT_SECRET}"
-  ingest_connector "${CONNECTOR2_NAME}" "${CONNECTOR2_URL}" "${CONNECTOR2_CLIENT_ID}" "${CONNECTOR2_CLIENT_SECRET}"
+  ingest_connector "${CONNECTOR1_NAME}" "${CONNECTOR1_URL}" "${CONNECTOR1_CLIENT_ID}" "${CONNECTOR1_CLIENT_SECRET}" "${CONNECTOR1_ROLE}"
+  ingest_connector "${CONNECTOR2_NAME}" "${CONNECTOR2_URL}" "${CONNECTOR2_CLIENT_ID}" "${CONNECTOR2_CLIENT_SECRET}" "${CONNECTOR2_ROLE}"
   if [[ -n "${CONNECTOR3_NAME}" && -n "${CONNECTOR3_URL}" ]]; then
-    ingest_connector "${CONNECTOR3_NAME}" "${CONNECTOR3_URL}" "${CONNECTOR3_CLIENT_ID}" "${CONNECTOR3_CLIENT_SECRET}"
+    ingest_connector "${CONNECTOR3_NAME}" "${CONNECTOR3_URL}" "${CONNECTOR3_CLIENT_ID}" "${CONNECTOR3_CLIENT_SECRET}" "${CONNECTOR3_ROLE}"
   fi
 
   # One line that can be compared with the registry. A connector declared here
@@ -713,13 +735,27 @@ main() {
   # which is a fact about the deployment, not a fault - or one that has stopped
   # publishing. Both need saying; only the reader can tell them apart, and the
   # reader could not see either before.
-  printf 'federation_summary declared=%s contributing=%s empty=%s unavailable=%s
-'     "${#FEDERATION_DECLARED[@]}" "${#FEDERATION_CONTRIBUTING[@]}"     "${#FEDERATION_EMPTY[@]}" "${#FEDERATION_UNAVAILABLE[@]}"
+  printf 'federation_summary declared=%s providers=%s contributing=%s empty=%s unavailable=%s\n' \
+    "${#FEDERATION_DECLARED[@]}" "${#FEDERATION_PROVIDERS[@]}" \
+    "${#FEDERATION_CONTRIBUTING[@]}" "${#FEDERATION_EMPTY[@]}" "${#FEDERATION_UNAVAILABLE[@]}"
   for connector_name in "${FEDERATION_DECLARED[@]}"; do
-    outcome=contributing
-    for empty in "${FEDERATION_EMPTY[@]:-}"; do
-      [[ "${empty}" == "${connector_name}" ]] && outcome=empty
+    # A connector that consumes is not a provider that failed. Written as an
+    # if rather than a && chain: under set -e a failing test as the last
+    # command of a loop body is a way to leave the script without meaning to.
+    outcome=consumer
+    for provider in "${FEDERATION_PROVIDERS[@]:-}"; do
+      if [[ "${provider}" == "${connector_name}" ]]; then
+        outcome=contributing
+        break
+      fi
     done
+    if [[ "${outcome}" != "consumer" ]]; then
+      for empty in "${FEDERATION_EMPTY[@]:-}"; do
+        if [[ "${empty}" == "${connector_name}" ]]; then
+          outcome=empty
+        fi
+      done
+    fi
     for unavailable in "${FEDERATION_UNAVAILABLE[@]:-}"; do
       [[ "${unavailable}" == "${connector_name}" ]] && outcome=unavailable
     done
