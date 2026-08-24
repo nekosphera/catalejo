@@ -721,6 +721,38 @@ ingest_connector() {
   rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
 }
 
+declare_registry_connectors() {
+  # El catálogo declara lo que dice el registro de participantes.
+  #
+  # Antes declaraba tres conectores fijos que venían de estas variables de
+  # entorno, así que un alta podía crear un participante -- con su grupo de
+  # Keycloak y su consola -- que el catálogo no nombraba en ninguna parte. Esa
+  # era la tercera fuente de verdad: el 23 de agosto de 2026 ningún conector
+  # estaba a la vez en el catálogo, el registro y Keycloak en ningún dominio.
+  #
+  # Un conector del registro sin EDC propio se declara como consumidor: no se
+  # le pide catálogo, y sale en federation_connector con outcome=consumer, que
+  # es exactamente lo que es. No se inventa ninguna URL para él.
+  local url payload connector_name already
+  url="${ONBOARDING_API_URL:-http://onboarding-api:8092}/api/v1/participants"
+  payload=$(curl -fsS --max-time 20 "${url}" 2>/dev/null) || {
+    echo "[federator] WARN registro de participantes ilegible en ${url}; se declara sólo lo configurado" >&2
+    return 0
+  }
+  while read -r connector_name; do
+    [[ -n "${connector_name}" ]] || continue
+    already=no
+    for declared in "${FEDERATION_DECLARED[@]:-}"; do
+      if [[ "${declared}" == "${connector_name}" ]]; then
+        already=yes
+        break
+      fi
+    done
+    [[ "${already}" == yes ]] && continue
+    FEDERATION_DECLARED+=("${connector_name}")
+  done < <(printf '%s' "${payload}" | jq -r '.items[]?.attributes.connectorId // empty' | sort -u)
+}
+
 main() {
   local connector_name outcome empty unavailable
   ensure_dataset
@@ -729,6 +761,7 @@ main() {
   if [[ -n "${CONNECTOR3_NAME}" && -n "${CONNECTOR3_URL}" ]]; then
     ingest_connector "${CONNECTOR3_NAME}" "${CONNECTOR3_URL}" "${CONNECTOR3_CLIENT_ID}" "${CONNECTOR3_CLIENT_SECRET}" "${CONNECTOR3_ROLE}"
   fi
+  declare_registry_connectors
 
   # One line that can be compared with the registry. A connector declared here
   # and contributing nothing is either a connector with nothing to publish -
