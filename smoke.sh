@@ -15,9 +15,9 @@ cd "$here"
 
 export FUSEKI_ADMIN_PASSWORD="${FUSEKI_ADMIN_PASSWORD:-smoke-only}"
 export FUSEKI_DATASET="${FUSEKI_DATASET:-catalogue}"
-export CONNECTOR1_NAME=connector-1
-export CONNECTOR1_URL=http://host.docker.internal:8099
-export CONNECTOR1_CLIENT_SECRET=stub-secret
+export CATALOGUE_CONNECTOR_NAME=example-connector
+export CATALOGUE_CONNECTOR_URL=http://host.docker.internal:8099
+export CATALOGUE_CONNECTOR_CLIENT_SECRET=stub-secret
 export KEYCLOAK_URL=http://host.docker.internal:8099
 export FEDERATION_INTERVAL_SECONDS=3600
 
@@ -48,7 +48,7 @@ curl -fsS "http://127.0.0.1:3030/$/ping" >/dev/null
 
 echo "[smoke] federating"
 docker compose run --rm --no-deps \
-  -e CONNECTOR1_URL -e KEYCLOAK_URL -e CONNECTOR1_CLIENT_SECRET \
+  -e CATALOGUE_CONNECTOR_NAME -e CATALOGUE_CONNECTOR_URL -e KEYCLOAK_URL -e CATALOGUE_CONNECTOR_CLIENT_SECRET \
   federator /bin/sh -c '
     apk add --no-cache bash curl jq >/dev/null
     cp /catalejo/federator/federate-catalogues.sh /tmp/federate.sh

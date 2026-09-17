@@ -49,36 +49,21 @@ KEYCLOAK_REALM="${KEYCLOAK_REALM:-dataspace}"
 KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-}"
 KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-}"
 
-CONNECTOR1_NAME="${CONNECTOR1_NAME:-connector-1}"
-CONNECTOR1_URL="${CONNECTOR1_URL:-http://localhost:8080}"
-CONNECTOR1_CLIENT_ID="${CONNECTOR1_CLIENT_ID:-edc-connector}"
-CONNECTOR1_CLIENT_SECRET="${CONNECTOR1_CLIENT_SECRET:-}"
-# What each connector is for. A connector that consumes is not a provider that
-# failed, and the two were indistinguishable in the count. Overridable per
-# deployment, because a role is a declaration and declarations change.
-CONNECTOR1_ROLE="${CONNECTOR1_ROLE:-provider}"
-
-# No URL default, the same shape as the third connector below: a deployment
-# that declares one connector has one connector. Inventing a second one at
-# localhost:8081 made every run of a single-connector deployment warn about a
-# missing secret for a connector nobody had configured - which is the first
-# thing anyone following the published quickstart sees. Where a second
-# connector does exist it is declared, so nothing that works today changes.
-CONNECTOR2_NAME="${CONNECTOR2_NAME:-connector-2}"
-CONNECTOR2_URL="${CONNECTOR2_URL:-}"
-CONNECTOR2_CLIENT_ID="${CONNECTOR2_CLIENT_ID:-edc-connector-2}"
-CONNECTOR2_CLIENT_SECRET="${CONNECTOR2_CLIENT_SECRET:-}"
-# consumer, on all three domains. Its registry entry is consumer-only with
-# capabilities ["consume"], so publishing nothing is what it is for - and the
-# summary below used to count that as an empty provider, which reads as a
-# federation missing a participant every single run.
-CONNECTOR2_ROLE="${CONNECTOR2_ROLE:-consumer}"
-
-CONNECTOR3_NAME="${CONNECTOR3_NAME:-}"
-CONNECTOR3_URL="${CONNECTOR3_URL:-}"
-CONNECTOR3_CLIENT_ID="${CONNECTOR3_CLIENT_ID:-edc-connector-3}"
-CONNECTOR3_CLIENT_SECRET="${CONNECTOR3_CLIENT_SECRET:-}"
-CONNECTOR3_ROLE="${CONNECTOR3_ROLE:-provider}"
+# Which connectors exist is not configured here. Every participant owns its own
+# connector (ADR-003), the participant registry of the onboarding service lists
+# them, and each one answers through the connector gateway at
+# ${CONNECTOR_GATEWAY_URL}/api/<connector-id>. The shared connectors this file
+# used to name one by one are retired.
+ONBOARDING_API_URL="${ONBOARDING_API_URL:-http://onboarding-api:8092}"
+CONNECTOR_GATEWAY_URL="${CONNECTOR_GATEWAY_URL:-}"
+# Standalone use (the published Catalejo bundle): one connector declared by its
+# URL, with no onboarding registry behind it. When CATALOGUE_CONNECTOR_URL is
+# set the registry is not read at all.
+CATALOGUE_CONNECTOR_NAME="${CATALOGUE_CONNECTOR_NAME:-}"
+CATALOGUE_CONNECTOR_URL="${CATALOGUE_CONNECTOR_URL:-}"
+CATALOGUE_CONNECTOR_CLIENT_ID="${CATALOGUE_CONNECTOR_CLIENT_ID:-catalogue-reader}"
+CATALOGUE_CONNECTOR_CLIENT_SECRET="${CATALOGUE_CONNECTOR_CLIENT_SECRET:-}"
+CATALOGUE_CONNECTOR_ROLE="${CATALOGUE_CONNECTOR_ROLE:-provider}"
 
 FEDERATION_FETCH_RETRIES="${FEDERATION_FETCH_RETRIES:-5}"
 FEDERATION_FETCH_RETRY_DELAY_SECONDS="${FEDERATION_FETCH_RETRY_DELAY_SECONDS:-1}"
@@ -98,10 +83,8 @@ KEYCLOAK_ADMIN_TOKEN=""
 
 # What each declared connector turned out to contribute. Every run already knew
 # this and said it one line at a time, so a connector that stopped publishing
-# read exactly like one that never did - and connector-2 has been fetching zero
-# assets on all three domains for as long as there are logs, in a WARN nobody
-# reads. Reconciled at the end of the run instead, in one line, against what
-# was declared.
+# read exactly like one that never did. Reconciled at the end of the run
+# instead, in one line, against what was declared.
 FEDERATION_DECLARED=()
 FEDERATION_CONTRIBUTING=()
 FEDERATION_EMPTY=()
@@ -721,24 +704,87 @@ ingest_connector() {
   rm -f "${assets_file}" "${policies_file}" "${contracts_file}" "${DESIRED_FILE}"
 }
 
+REGISTRY_PAYLOAD=""
+REGISTRY_READ=no
+
+fetch_registry() {
+  # Read once per run: ingestion and declaration must see the same list.
+  local url
+  if [[ "${REGISTRY_READ}" == yes ]]; then
+    printf '%s' "${REGISTRY_PAYLOAD}"
+    return 0
+  fi
+  url="${ONBOARDING_API_URL%/}/api/v1/participants"
+  if ! REGISTRY_PAYLOAD=$(curl -fsS --max-time 20 "${url}" 2>/dev/null); then
+    echo "[federator] WARN registro de participantes ilegible en ${url}; no se federa ningún conector" >&2
+    REGISTRY_PAYLOAD=""
+  fi
+  REGISTRY_READ=yes
+  printf '%s' "${REGISTRY_PAYLOAD}"
+}
+
+# connector-id <TAB> keycloak client <TAB> provider|consumer, one per line.
+registry_connectors() {
+  fetch_registry | jq -r '
+    .items[]?
+    | select((.attributes.connectorId // "") != "")
+    | [ .attributes.connectorId,
+        # "-" rather than empty: read with a tab IFS folds an empty field away.
+        (if (.attributes.keycloakClientId // "") == "" then "-" else .attributes.keycloakClientId end),
+        (if ((.roles // []) | index("provider")) then "provider" else "consumer" end) ]
+    | @tsv' 2>/dev/null | sort -u
+}
+
+ingest_registry_connectors() {
+  # Every participant's own connector, through the gateway, with the service
+  # account of that participant's own client. Without a gateway nothing is
+  # fetched and declare_registry_connectors still names them.
+  local connector_name client_id role
+  if [[ -z "${CONNECTOR_GATEWAY_URL}" ]]; then
+    echo "[federator] WARN CONNECTOR_GATEWAY_URL is not set; no participant connector is fetched" >&2
+    return 0
+  fi
+  while IFS=$'\t' read -r connector_name client_id role; do
+    [[ -n "${connector_name}" ]] || continue
+    [[ "${client_id}" == "-" ]] && client_id=""
+    ingest_connector "${connector_name}" "${CONNECTOR_GATEWAY_URL%/}/api/${connector_name}" \
+      "${client_id:-participant-${connector_name}}" "" "${role:-consumer}"
+  done < <(registry_connectors)
+}
+
+prune_unregistered_graphs() {
+  # A graph for a connector that is no longer in the registry keeps answering
+  # catalogue queries with offers nobody can negotiate: the retired shared
+  # connectors, or a participant who left. Only on a registry that was read
+  # and parsed -- an unreadable one prunes nothing.
+  local registered graph name
+  printf '%s' "${REGISTRY_PAYLOAD}" | jq -e '.items | type == "array"' >/dev/null 2>&1 || return 0
+  registered=$(printf '%s' "${REGISTRY_PAYLOAD}" | jq -r '.items[]?.attributes.connectorId // empty' | sort -u)
+  while IFS= read -r graph; do
+    [[ -n "${graph}" ]] || continue
+    name="${graph#"${GRAPH_BASE_IRI}/"}"
+    [[ -n "${name}" && "${name}" != */* && "${name}" != .* ]] || continue
+    if ! grep -qxF "${name}" <<<"${registered}"; then
+      echo "[federator] dropping graph <${graph}>: ${name} is not in the participant registry" >&2
+      sparql_update "DROP SILENT GRAPH <${graph}>"
+    fi
+  done < <(
+    sparql_select_json "
+      SELECT DISTINCT ?g WHERE {
+        GRAPH ?g { ?s ?p ?o }
+        FILTER(STRSTARTS(STR(?g), \"${GRAPH_BASE_IRI}/\"))
+      }" | jq -r '.results.bindings[].g.value'
+  )
+}
+
 declare_registry_connectors() {
   # El catálogo declara lo que dice el registro de participantes.
   #
-  # Antes declaraba tres conectores fijos que venían de estas variables de
-  # entorno, así que un alta podía crear un participante -- con su grupo de
-  # Keycloak y su consola -- que el catálogo no nombraba en ninguna parte. Esa
-  # era la tercera fuente de verdad: el 23 de agosto de 2026 ningún conector
-  # estaba a la vez en el catálogo, el registro y Keycloak en ningún dominio.
-  #
-  # Un conector del registro sin EDC propio se declara como consumidor: no se
-  # le pide catálogo, y sale en federation_connector con outcome=consumer, que
-  # es exactamente lo que es. No se inventa ninguna URL para él.
-  local url payload connector_name already
-  url="${ONBOARDING_API_URL:-http://onboarding-api:8092}/api/v1/participants"
-  payload=$(curl -fsS --max-time 20 "${url}" 2>/dev/null) || {
-    echo "[federator] WARN registro de participantes ilegible en ${url}; se declara sólo lo configurado" >&2
-    return 0
-  }
+  # Un conector del registro que no se pudo leer ya está declarado por
+  # ingest_connector; uno que no se llegó a pedir (sin gateway) se declara aquí
+  # como consumidor: sale en federation_connector con outcome=consumer y no se
+  # inventa ninguna URL para él.
+  local connector_name already declared
   while read -r connector_name; do
     [[ -n "${connector_name}" ]] || continue
     already=no
@@ -750,18 +796,21 @@ declare_registry_connectors() {
     done
     [[ "${already}" == yes ]] && continue
     FEDERATION_DECLARED+=("${connector_name}")
-  done < <(printf '%s' "${payload}" | jq -r '.items[]?.attributes.connectorId // empty' | sort -u)
+  done < <(fetch_registry | jq -r '.items[]?.attributes.connectorId // empty' 2>/dev/null | sort -u)
 }
 
 main() {
   local connector_name outcome empty unavailable
   ensure_dataset
-  ingest_connector "${CONNECTOR1_NAME}" "${CONNECTOR1_URL}" "${CONNECTOR1_CLIENT_ID}" "${CONNECTOR1_CLIENT_SECRET}" "${CONNECTOR1_ROLE}"
-  ingest_connector "${CONNECTOR2_NAME}" "${CONNECTOR2_URL}" "${CONNECTOR2_CLIENT_ID}" "${CONNECTOR2_CLIENT_SECRET}" "${CONNECTOR2_ROLE}"
-  if [[ -n "${CONNECTOR3_NAME}" && -n "${CONNECTOR3_URL}" ]]; then
-    ingest_connector "${CONNECTOR3_NAME}" "${CONNECTOR3_URL}" "${CONNECTOR3_CLIENT_ID}" "${CONNECTOR3_CLIENT_SECRET}" "${CONNECTOR3_ROLE}"
+  if [[ -n "${CATALOGUE_CONNECTOR_URL}" ]]; then
+    ingest_connector "${CATALOGUE_CONNECTOR_NAME:?set CATALOGUE_CONNECTOR_NAME}" "${CATALOGUE_CONNECTOR_URL}" \
+      "${CATALOGUE_CONNECTOR_CLIENT_ID}" "${CATALOGUE_CONNECTOR_CLIENT_SECRET}" "${CATALOGUE_CONNECTOR_ROLE}"
+  else
+    fetch_registry >/dev/null
+    ingest_registry_connectors
+    declare_registry_connectors
+    prune_unregistered_graphs
   fi
-  declare_registry_connectors
 
   # One line that can be compared with the registry. A connector declared here
   # and contributing nothing is either a connector with nothing to publish -
@@ -771,7 +820,9 @@ main() {
   printf 'federation_summary declared=%s providers=%s contributing=%s empty=%s unavailable=%s\n' \
     "${#FEDERATION_DECLARED[@]}" "${#FEDERATION_PROVIDERS[@]}" \
     "${#FEDERATION_CONTRIBUTING[@]}" "${#FEDERATION_EMPTY[@]}" "${#FEDERATION_UNAVAILABLE[@]}"
-  for connector_name in "${FEDERATION_DECLARED[@]}"; do
+  for connector_name in "${FEDERATION_DECLARED[@]:-}"; do
+    # An empty registry declares nothing; the expansion above yields one "".
+    [[ -n "${connector_name}" ]] || continue
     # A connector that consumes is not a provider that failed. Written as an
     # if rather than a && chain: under set -e a failing test as the last
     # command of a loop body is a way to leave the script without meaning to.

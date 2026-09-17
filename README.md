@@ -25,9 +25,9 @@ Those belong to the connector.
 
 ```bash
 export FUSEKI_ADMIN_PASSWORD=change-me
-export CONNECTOR1_NAME=connector-1
-export CONNECTOR1_URL=https://your-connector.example.org
-export CONNECTOR1_CLIENT_SECRET=…
+export CATALOGUE_CONNECTOR_NAME=my-connector
+export CATALOGUE_CONNECTOR_URL=https://your-connector.example.org
+export CATALOGUE_CONNECTOR_CLIENT_SECRET=…
 export KEYCLOAK_URL=https://auth.example.org
 
 docker compose up -d
