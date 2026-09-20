@@ -95,21 +95,35 @@ escape_literal() {
   printf "%s" "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
+# A connector with a few hundred assets produces an update far longer than the
+# argument list the kernel accepts, and curl never even started: the whole run
+# died with "Argument list too long" and the catalog silently kept the previous
+# graph. The update travels through a file instead, so its size stops mattering.
 sparql_update() {
   local update="$1"
+  local payload status=0
+  payload="$(mktemp)"
+  printf "%s" "${update}" >"${payload}"
   curl -fsS -X POST \
     -u "${FUSEKI_ADMIN_USER}:${FUSEKI_ADMIN_PASSWORD}" \
     "${FUSEKI_BASE_URL}/${FUSEKI_DATASET}/update" \
-    --data-urlencode "update=${update}" >/dev/null
+    --data-urlencode "update@${payload}" >/dev/null || status=$?
+  rm -f "${payload}"
+  return "${status}"
 }
 
 sparql_select_json() {
   local query="$1"
+  local payload status=0
+  payload="$(mktemp)"
+  printf "%s" "${query}" >"${payload}"
   curl -fsS -X POST \
     -u "${FUSEKI_ADMIN_USER}:${FUSEKI_ADMIN_PASSWORD}" \
     -H "Accept: application/sparql-results+json" \
     "${FUSEKI_BASE_URL}/${FUSEKI_DATASET}/query" \
-    --data-urlencode "query=${query}"
+    --data-urlencode "query@${payload}" || status=$?
+  rm -f "${payload}"
+  return "${status}"
 }
 
 # One line of the model this federator maintains: a subject, a predicate, a
