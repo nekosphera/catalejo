@@ -41,6 +41,16 @@ fi
 FUSEKI_BASE_URL="${FUSEKI_BASE_URL:-http://localhost:3030}"
 FUSEKI_DATASET="${FUSEKI_DATASET:-dataspace}"
 GRAPH_BASE_IRI="${GRAPH_BASE_IRI:-urn:dataspace:catalog}"
+# La base publica con la que se construye dcat:accessURL. Es el medio de acceso
+# que el catalogo declara, y tiene que ser una direccion que el consumidor pueda
+# pedir: la ruta de descarga del gateway, no el origen del dato.
+#
+# Sin valor por defecto, y por dos razones. Una, el despliegue es quien sabe su
+# propio nombre publico y este script se exporta a un paquete generico que no
+# puede nombrar ningun host -- tests/test_catalejo_bundle.py lo comprueba. Dos,
+# un valor por defecto equivocado produce un catalogo que declara un medio de
+# acceso que no responde, que es peor que fallar aqui.
+DATASPACE_PUBLIC_BASE_URL="${DATASPACE_PUBLIC_BASE_URL:-}"
 FUSEKI_ADMIN_USER="${FUSEKI_ADMIN_USER:-admin}"
 FUSEKI_ADMIN_PASSWORD="${FUSEKI_ADMIN_PASSWORD:-admin}"
 
@@ -568,11 +578,10 @@ ingest_connector() {
 
   while IFS= read -r row; do
     [[ -z "${row}" ]] && continue
-    local asset_id name base_url description language publisher license_url access_rights theme keywords media_type delivery_mode
+    local asset_id name description language publisher license_url access_rights theme keywords media_type delivery_mode
     asset_id=$(echo "${row}" | jq -r '.id // .["@id"] // empty')
     [[ -z "${asset_id}" ]] && continue
     name=$(echo "${row}" | jq -r '.properties["dct:title"] // .properties.name // empty')
-    base_url=$(echo "${row}" | jq -r '.properties.objectUrl // .dataAddress.baseUrl // empty')
     description=$(echo "${row}" | jq -r '.properties["dct:description"] // .properties.description // empty')
     language=$(echo "${row}" | jq -r '.properties["dct:language"] // .properties.language // empty')
     publisher=$(echo "${row}" | jq -r '.properties["dct:publisher"] // .properties.publisher // empty')
@@ -599,7 +608,10 @@ ingest_connector() {
     emit_literal "${asset_uri}" "urn:edc:keywords" "${keywords}"
     emit_literal "${asset_uri}" "urn:edc:mediaType" "${media_type}"
     emit_literal "${asset_uri}" "urn:edc:deliveryMode" "${delivery_mode}"
-    emit_literal "${asset_uri}" "urn:edc:baseUrl" "${base_url}"
+    # Aqui se emitia urn:edc:baseUrl con la direccion real del dato. Salia por
+    # /fuseki/dataspace/query, que responde sin credenciales, y no lo pedia
+    # ningun requisito: dcat:accessURL de mas abajo ya es el medio de acceso.
+    # Eran 153 triples con el origen de cada activo, duplicando la misma fuga.
 
     # The same asset, in DCAT. These are the terms the shapes in
     # generated/vocabularies/dcat-ap-mydataspace/1.0.0/shapes.ttl target, so
@@ -637,11 +649,29 @@ ingest_connector() {
     # Where the data is actually obtained. dcat:accessURL belongs to a
     # distribution, not to the dataset, and Req.-BB-DSO-005 asks the catalogue
     # to carry the means of access.
-    if [[ "${base_url}" == http://* || "${base_url}" == https://* ]]; then
+    #
+    # El medio de acceso es el conector, no el origen. Hasta el 28 de septiembre
+    # de 2026 esto emitia el baseUrl del dataAddress, y como /fuseki/dataspace/query
+    # responde sin credenciales, el catalogo publicaba la direccion desde la que
+    # el dato se descarga saltandose la negociacion: 153 accessURL, de las que
+    # 150 entregaban bytes a un curl sin token ni politica aceptada.
+    #
+    # Cumplir el requisito y ejercer el control no estan renidos si accessURL
+    # apunta a la ruta de descarga del gateway, que exige cuenta, perfil
+    # consumidor y acuerdo de contrato para lo ajeno. El origen se queda en el
+    # dataAddress, que es privado del proveedor y no sale de la Management API.
+    # Sin base publica no se emite la distribucion. Concatenar sobre una
+    # cadena vacia daria un accessURL relativo, y un IRI relativo en RDF no
+    # resuelve a nada: el consumidor recibe una direccion que no existe. Mejor
+    # un catalogo sin medio de acceso, que se ve, que uno con uno roto.
+    if [[ -n "${DATASPACE_PUBLIC_BASE_URL}" ]]; then
+      local encoded_asset_id access_url
+      encoded_asset_id=$(jq -rn --arg s "${asset_id}" '$s|@uri')
+      access_url="${DATASPACE_PUBLIC_BASE_URL%/}/api/${connector_name}/management/v3/assets/${encoded_asset_id}/download"
       local distribution_uri="${asset_uri}:distribution"
       emit_iri "${asset_uri}" "${DCAT_NS}distribution" "${distribution_uri}"
       emit_iri "${distribution_uri}" "${RDF_TYPE}" "${DCAT_NS}Distribution"
-      emit_iri "${distribution_uri}" "${DCAT_NS}accessURL" "${base_url}"
+      emit_iri "${distribution_uri}" "${DCAT_NS}accessURL" "${access_url}"
       emit_present_literal "${distribution_uri}" "${DCAT_NS}mediaType" "${media_type}"
     fi
     assets_count=$((assets_count + 1))
@@ -814,6 +844,13 @@ declare_registry_connectors() {
 }
 
 main() {
+  # Aqui y no arriba: las pruebas cargan este fichero para ejercitar sus
+  # funciones sueltas, y una salida en el cuerpo del script se las lleva por
+  # delante. Una ejecucion de verdad empieza en main.
+  if [[ -z "${DATASPACE_PUBLIC_BASE_URL}" ]]; then
+    echo "[federator] DATASPACE_PUBLIC_BASE_URL no esta definida: es la base de dcat:accessURL, el medio de acceso que publica el catalogo" >&2
+    return 2
+  fi
   local connector_name outcome empty unavailable
   ensure_dataset
   if [[ -n "${CATALOGUE_CONNECTOR_URL}" ]]; then

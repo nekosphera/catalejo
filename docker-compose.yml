@@ -44,6 +44,13 @@ services:
       FUSEKI_DATASET: ${FUSEKI_DATASET:-catalogue}
       FUSEKI_ADMIN_USER: admin
       FUSEKI_ADMIN_PASSWORD: ${FUSEKI_ADMIN_PASSWORD:?set FUSEKI_ADMIN_PASSWORD}
+      # The base for dcat:accessURL, the means of access the catalogue
+      # publishes. It has to be an address a consumer can ask for -- the
+      # connector's download route -- and never the origin of the data, which
+      # belongs to the provider's private dataAddress. Required, because a
+      # wrong default produces a catalogue that advertises a door nobody can
+      # open, and because this bundle names no host of its own.
+      DATASPACE_PUBLIC_BASE_URL: ${DATASPACE_PUBLIC_BASE_URL:?set DATASPACE_PUBLIC_BASE_URL}
       # The connector whose management API is catalogued.
       CATALOGUE_CONNECTOR_NAME: ${CATALOGUE_CONNECTOR_NAME:?set CATALOGUE_CONNECTOR_NAME}
       CATALOGUE_CONNECTOR_URL: ${CATALOGUE_CONNECTOR_URL:?set CATALOGUE_CONNECTOR_URL}

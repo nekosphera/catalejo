@@ -19,6 +19,10 @@ export CATALOGUE_CONNECTOR_NAME=example-connector
 export CATALOGUE_CONNECTOR_URL=http://host.docker.internal:8099
 export CATALOGUE_CONNECTOR_CLIENT_SECRET=stub-secret
 export KEYCLOAK_URL=http://host.docker.internal:8099
+# The means of access the catalogue advertises. The smoke run has no gateway of
+# its own, so it points at the same stub: what is being checked here is that a
+# dcat:accessURL is emitted and is absolute, not that it serves bytes.
+export DATASPACE_PUBLIC_BASE_URL=http://host.docker.internal:8099
 export FEDERATION_INTERVAL_SECONDS=3600
 
 stub_pid=""
@@ -49,6 +53,7 @@ curl -fsS "http://127.0.0.1:3030/$/ping" >/dev/null
 echo "[smoke] federating"
 docker compose run --rm --no-deps \
   -e CATALOGUE_CONNECTOR_NAME -e CATALOGUE_CONNECTOR_URL -e KEYCLOAK_URL -e CATALOGUE_CONNECTOR_CLIENT_SECRET \
+  -e DATASPACE_PUBLIC_BASE_URL \
   federator /bin/sh -c '
     apk add --no-cache bash curl jq >/dev/null
     cp /catalejo/federator/federate-catalogues.sh /tmp/federate.sh
