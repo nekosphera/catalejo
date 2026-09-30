@@ -29,13 +29,23 @@ export CATALOGUE_CONNECTOR_NAME=my-connector
 export CATALOGUE_CONNECTOR_URL=https://your-connector.example.org
 export CATALOGUE_CONNECTOR_CLIENT_SECRET=…
 export KEYCLOAK_URL=https://auth.example.org
+export DATASPACE_PUBLIC_BASE_URL=https://your-dataspace.example.org
 
 docker compose up -d
 ```
 
-The catalogue is then a SPARQL endpoint on `127.0.0.1:3030`:
+`DATASPACE_PUBLIC_BASE_URL` is required: it is the base of the
+`dcat:accessURL` the catalogue publishes (`<base>/api/<connector>/management/v3/assets/<id>/download`),
+the address a consumer asks for, never the origin of the data.
+
+The catalogue is then a SPARQL endpoint on `127.0.0.1:3030`, dataset
+`catalogue` unless `FUSEKI_DATASET` says otherwise
+(`http://127.0.0.1:3030/catalogue/query`):
 
 ```sparql
+PREFIX dcat: <http://www.w3.org/ns/dcat#>
+PREFIX dct:  <http://purl.org/dc/terms/>
+
 SELECT ?title ?publisher ?accessURL WHERE {
   GRAPH ?g {
     ?dataset a dcat:Dataset ;
