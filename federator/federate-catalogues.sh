@@ -646,6 +646,16 @@ ingest_connector() {
       done < <(printf '%s\n' "${keywords}" | tr ',' "\n")
     fi
 
+    # El modelo de datos que declara el activo (dct:conformsTo), un IRI por
+    # tripleta: el de EDINT y el de Smart Data Models, cuando están los dos.
+    # Con ellos una consulta SPARQL encuentra el dataset por cualquiera de los
+    # dos nombres. Sólo IRIs absolutos: un texto suelto no es un modelo.
+    local conforms_iri
+    while IFS= read -r conforms_iri; do
+      [[ "${conforms_iri}" == http://* || "${conforms_iri}" == https://* ]] || continue
+      emit_iri "${asset_uri}" "${DCT_NS}conformsTo" "${conforms_iri}"
+    done < <(echo "${row}" | jq -r '(.properties["dct:conformsTo"] // .properties.conformsTo // empty) | if type == "array" then .[] elif type == "string" then (split(",") | .[] | gsub("^\\s+|\\s+$"; "")) else empty end')
+
     # Where the data is actually obtained. dcat:accessURL belongs to a
     # distribution, not to the dataset, and Req.-BB-DSO-005 asks the catalogue
     # to carry the means of access.
