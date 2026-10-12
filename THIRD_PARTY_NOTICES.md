@@ -15,10 +15,3 @@ Before redistribution or deployment:
 Known technology families referenced across the ecosystem include Eclipse Dataspace Components, FIWARE/Orion-LD, SIMPL, Gaia-X/Danube, NGSI-LD, DCAT-AP, ODRL, and their dependencies. This list is contextual, not a complete software bill of materials.
 
 A release intended for external redistribution must include a dependency-derived inventory and any notices required by the exact versions shipped.
-
-## Copied into this repository: the work environment of the console
-
-- `ui/vendor/leaflet/`: Leaflet 1.9.4 (BSD-2-Clause, © Vladimir Agafonkin, © CloudMade). Licence in `ui/vendor/leaflet/LICENSE`.
-- `ui/vendor/leaflet.markercluster/`: Leaflet.markercluster 1.5.3 (MIT, © Dave Leaver). Licence in `ui/vendor/leaflet.markercluster/LICENSE`.
-- `ui/jupyter/` is not in the repository: `tools/build_jupyterlite.py` builds it at deployment from JupyterLite 0.6.4 (BSD-3-Clause), jupyterlite-pyodide-kernel 0.6.1 (BSD-3-Clause), Pyodide 0.27.6 (MPL-2.0) and the Python packages it carries (numpy, pandas, matplotlib and their dependencies, each under its own licence), plus comm 0.2.2 (BSD-3-Clause). The build keeps their licence files.
-- Map tiles: © OpenStreetMap contributors (ODbL), proxied and cached by the portal under the OpenStreetMap tile usage policy; the map shows the attribution.
